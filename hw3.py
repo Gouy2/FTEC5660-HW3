@@ -164,48 +164,68 @@ def point5_profit_margin(sql_query: Any) -> tuple[str, str]:
     return verdict, evidence
 
 
-def gather_sales_evidence(interview: Any) -> str:
-    """Fisher point 4: spend as few interviews as possible on the sales team."""
-    role = INTERVIEW_PLAN["role"]
-    answer = _tool_text(interview.invoke({"role": role, "topic": INTERVIEW_PLAN["topic"]}))
-    if _is_non_answer(answer):
-        fallback = INTERVIEW_PLAN["fallback_role"]
-        fallback_answer = _tool_text(interview.invoke({"role": fallback, "topic": INTERVIEW_PLAN["topic"]}))
-        if not _is_non_answer(fallback_answer):
-            return f"A {fallback} said: {fallback_answer}"
-    return f"A {role} said: {answer}"
+def point4_sales_organisation(model: Any, interview: Any) -> tuple[str, str]:
+    """Fisher point 4: interview the people who know, cheapest first.
+
+    Each answer is classified by the model as PASS, FAIL or UNKNOWN (the person
+    could not comment). Only on UNKNOWN is the next role asked, so a company
+    normally costs one interview and never more than two.
+    """
+    topic = INTERVIEW_PLAN["topic"]
+    heard = []
+    for role in (INTERVIEW_PLAN["role"], INTERVIEW_PLAN["fallback_role"]):
+        answer = _tool_text(interview.invoke({"role": role, "topic": topic}))
+        evidence = f"A {role} said: {answer}"
+        heard.append(evidence)
+        if "limit reached" in answer.lower():
+            break
+        verdict = classify_sales_answer(model, evidence)
+        if verdict in VERDICTS:
+            return verdict, evidence
+    # Nobody could judge the sales force: Fisher wants a sales force that
+    # outsiders notice, so silence is not evidence of an above-average one.
+    return "FAIL", " ".join(heard) + " (no informed opinion found)"
 
 
-def _is_non_answer(answer: str) -> bool:
-    """True when the person says they cannot comment, or the limit was reached."""
-    lowered = answer.lower()
-    return any(
-        marker in lowered
-        for marker in ("can't say", "cannot say", "can't comment", "cannot comment", "no idea", "limit reached")
-    )
+def _parse_label(text: str) -> str | None:
+    """Find PASS, FAIL or UNKNOWN in a model reply such as 'PASS.' or '**FAIL**'."""
+    words = "".join(c if c.isalpha() else " " for c in text.upper()).split()
+    for label in ("UNKNOWN", "PASS", "FAIL"):
+        if label in words:
+            return label
+    return None
 
 
 def classify_sales_answer(model: Any, evidence: str) -> str:
-    """Let the model read the interview answer and grade the sales organisation."""
+    """Let the model read one interview answer: PASS, FAIL or UNKNOWN."""
     prompt = (
         "You are applying Philip Fisher's point 4: 'Does the company have an above-average sales "
-        "organization?' Below is what an outside observer said about the company's sales force.\n\n"
+        "organization?' Below is what one outside observer said about the company's sales force.\n\n"
         f"{evidence}\n\n"
-        "Answer PASS if the sales organisation is described as better than average (close to "
-        "customers, technically helpful, feared by rivals, better trained than rivals). "
-        "Answer FAIL if it is described as weak, absent, price-list-only, or unable to keep staff. "
-        "Reply with exactly one word: PASS or FAIL."
+        "Reply PASS if the sales organisation is described as better than average (close to "
+        "customers, technically helpful, quick to respond, feared by rivals, better trained than rivals).\n"
+        "Reply FAIL if it is described as weak, absent, passive (only sends prices), "
+        "irrelevant to rivals, or constantly changing staff who do not know the product.\n"
+        "Reply UNKNOWN if the person says they do not deal with the sales team or cannot comment.\n"
+        "Reply with exactly one word: PASS, FAIL or UNKNOWN."
     )
-    reply = None
     try:
-        reply = normalize_verdict(model.invoke(prompt))
+        label = _parse_label(_tool_text(model.invoke(prompt)))
     except Exception:  # noqa: BLE001 - fall back to the keyword rule below
-        pass
-    return reply if reply in VERDICTS else _keyword_verdict(evidence)
+        label = None
+    if label == "UNKNOWN":
+        return "UNKNOWN"
+    return label if label in VERDICTS else _keyword_verdict(evidence)
+
+
+NON_ANSWER_HINTS = ("can't say", "cannot say", "can't comment", "cannot comment", "no idea", "wouldn't know")
 
 
 def _keyword_verdict(evidence: str) -> str:
+    """Rule-based backup used only when the model call fails."""
     lowered = evidence.lower()
+    if any(hint in lowered for hint in NON_ANSWER_HINTS):
+        return "UNKNOWN"
     if any(hint in lowered for hint in NEGATIVE_HINTS):
         return "FAIL"
     if any(hint in lowered for hint in POSITIVE_HINTS):
@@ -249,9 +269,7 @@ async def analyse_one(model: Any, name: str, tools: list[Any]) -> dict[str, Any]
 
     if 4 in CHOSEN_POINTS:
         try:
-            evidence = await asyncio.to_thread(gather_sales_evidence, interview)
-            verdict = await asyncio.to_thread(classify_sales_answer, model, evidence)
-            results[4] = (verdict, evidence)
+            results[4] = await asyncio.to_thread(point4_sales_organisation, model, interview)
         except Exception as exc:  # noqa: BLE001
             results[4] = ("PASS", f"Could not complete the interview ({exc}); no decision.")
 
