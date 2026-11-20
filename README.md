@@ -170,14 +170,78 @@ for each public company. Grading uses a private set of about 20 unseen
 companies with the same tools and the same answer key rules, but different
 names and wording, and scores your 3 points only.
 
-## Homework 3 solution:
-> to students: this is your report, see the homework description.
+## Homework 3 solution
+
+I chose **points 1, 4 and 5**. Run with `python3 hw3.py --data-folder public_test`; it takes about 8 seconds. (My Task 2 reflection is in a separate file, `REFLECTION.md`.)
 
 ### My 3 points and rules
-> for each point: why you chose it, your PASS rule in one or two sentences, and the evidence it uses. Quote Fisher where it helps.
+
+Before writing any agent code, I used the four tools from a small Python script to look at the public companies and check each rule against `ground_truth.json`. I only kept rules that agreed on all 20 companies and had a clear gap between the PASS and FAIL groups. The ground truth is built to stay far from the line, so if a rule had companies sitting right on the edge, I took that as a sign I had picked the wrong rule.
+
+**Point 1: Market potential for sales growth.**
+Fisher asks whether the company has *"products or services with sufficient market potential to make possible a sizable increase in sales for at least several years"*. I picked it because it is the first thing Fisher looks at, and because "sizable" can be measured directly from the order book. A growth figure on its own is hard to judge, though: 15% is great for food ingredients but weak for industrial robotics. So I compare the company with its own industry.
+
+- **Rule:** PASS if revenue growth from FY2023 to FY2025 (sum of `orders.amount` per calendar year) is at least the industry's `revenue_growth_2y_pct`. Otherwise FAIL.
+- **Evidence:** `orders`, `company`, `industry_medians`, through `sql_query`.
+- **What I learned:** I first tried a rolling window (last 12 months vs. the same 12 months two years earlier). It got `cobalt_holdings` wrong, because a weak first half of 2024 changes the base. The median is called `revenue_growth_2y_pct` and the fiscal year is the calendar year, so I switched to full fiscal years. That version matched all 20 companies.
+
+**Point 4: Above-average sales organization.**
+I wanted at least one point that uses Fisher's "scuttlebutt" method instead of the database. Point 4 fits well, because the people who deal with a sales force every day, customers and competitors, are exactly the people Fisher tells you to ask. It was also a good chance to plan tool calls, since interviews are limited to 10 per company and asking the wrong person still uses one up.
+
+- **Rule:** Ask a `customer` about `sales_team`. If they cannot comment, ask a `competitor`. PASS if the answer describes a sales force that is better than average (close to customers, technically helpful, feared or envied by rivals). FAIL if it is described as weak, passive ("just send the price list"), irrelevant to rivals, or constantly changing. If nobody can judge, FAIL, since a sales force nobody outside the company notices is not "above average".
+- **Evidence:** the `interview` tool. One interview per company on the public set, two at most.
+
+**Point 5: Worthwhile profit margin.**
+Fisher's point 5 asks *"Does the company have a worthwhile profit margin?"*, and the handout asks the key question directly: what does "worthwhile" mean? Margins depend a lot on the industry (semiconductor equipment vs. food ingredients), so a fixed number like 10% would not work. I used the industry median again, which also makes points 1 and 5 consistent with each other.
+
+- **Rule:** PASS if the FY2025 operating margin, (revenue − cost of sales − selling & admin − R&D) ÷ revenue, is at least the industry's `operating_margin_pct`. Otherwise FAIL.
+- **Evidence:** `orders`, `monthly_costs`, `company`, `industry_medians`, through `sql_query`.
+- **Robustness check:** I also computed the margin for FY2024 and for the last 12 months. All three windows gave the same verdict for all 20 companies, so this rule should hold up if the private set behaves the same way.
 
 ### Design
-> a visualization of your agent design and one paragraph describing it.
+
+```mermaid
+flowchart TD
+    A["analyze_companies()<br/>asyncio.gather: all companies in parallel"] --> B["analyse_one(company)<br/>try/except per company"]
+
+    B --> R{"Route each point<br/>to its evidence source"}
+
+    R -->|"Point 1"| P1["sql_query tool<br/>fixed SQL: FY2023 & FY2025 revenue<br/>+ industry growth median"]
+    R -->|"Point 5"| P5["sql_query tool<br/>fixed SQL: FY2025 revenue & costs<br/>+ industry margin median"]
+    R -->|"Point 4"| I1["interview tool<br/>customer · sales_team"]
+
+    P1 --> C1["Python: growth ≥ median ?"] --> V1["PASS / FAIL"]
+    P5 --> C5["Python: margin ≥ median ?"] --> V5["PASS / FAIL"]
+
+    I1 --> L1["DeepSeek call #1<br/>classify: PASS / FAIL / UNKNOWN"]
+    L1 -->|"UNKNOWN"| I2["interview tool<br/>competitor · sales_team"] --> L2["DeepSeek call<br/>classify again"]
+    L1 -->|"PASS / FAIL"| V4["PASS / FAIL"]
+    L2 --> V4
+    L1 -.->|"API error"| K["keyword fallback rule"] -.-> V4
+
+    V1 & V4 & V5 --> S["DeepSeek call #2<br/>write 2–3 sentence summary<br/>from the collected evidence"]
+    S --> O["{points: {1, 4, 5}, summary}"]
+```
+
+My agent is a fixed workflow rather than a free ReAct loop. I made that choice because the handout says model arithmetic was the most common cause of wrong verdicts, and because the code is graded on three runs, so I wanted the output to be the same every time. Each company goes through a **router** that sends every point to the tool where its evidence lives. Points 1 and 5 run a fixed SQL query through the provided `sql_query` tool, and all the sums, ratios and comparisons happen in SQL or Python, never in the model. Point 4 follows an **interview plan**: it asks the role most likely to know (a customer) first, and only spends a second interview on a competitor if the model labels the first answer as UNKNOWN. That is the only place where language understanding is needed, so that is where I use DeepSeek (`deepseek-v4-flash`, temperature 0). This is a small **prompt chain**: a classification call per answer, then one summary call that only rewrites evidence the code has already collected, so it cannot change a verdict. All companies run **in parallel** with `asyncio.gather`. Every point and every company has its own `try/except`, and if the API is down, a keyword rule takes over the classification, so the run always finishes and writes `results.csv`. I tested this by replacing the model with an object that always raises an error, and the run still scored 60/60.
 
 ### Results
-> your point score on `public_test`, the companies where your verdicts disagree with the public answers, and why.
+
+| Run on `public_test` | Point accuracy | Balanced score | Time |
+| --- | --- | --- | --- |
+| 1 | 60/60 | **100.0%** | 8.6 s |
+| 2 | 60/60 | **100.0%** | 7.7 s |
+| 3 | 60/60 | **100.0%** | 8.0 s |
+
+The verdicts were identical in all three runs, and each company used **1 of its 10 interviews**. I also ran the code from a fresh clone and a new virtual environment with only `requirements.txt`, and got the same result.
+
+**Disagreements with the public answers:** none in the final version. The one disagreement I had along the way was `cobalt_holdings` on point 1 with the rolling 12-month window, explained above. I fixed it by using fiscal years, which is also what the industry median field describes.
+
+**How safe are the rules?** The table below shows how far the closest company on each side is from the line. The gaps are large compared with the rounding in the data, so I don't expect small wording or number changes in the private set to flip a verdict.
+
+| Point | Closest PASS | Closest FAIL |
+| --- | --- | --- |
+| 1 (growth − median) | `hollins_group`: +3.1 pts | `driftwood_systems`: −3.4 pts |
+| 5 (margin − median) | `bramble_labs`: +1.7 pts | `halcyon_works`: −1.9 pts |
+
+For point 4, the risk in the private set is that interview answers are worded differently. To test this, I wrote 9 new answers in wording that does not appear in the public data (positive, negative and "can't comment" cases), and the classifier labelled all 9 correctly. One limitation is that the rule for point 4 trusts a single interview. That works here because the handout says informed people always agree, but in real scuttlebutt, Fisher would want to hear from several sources before deciding.
