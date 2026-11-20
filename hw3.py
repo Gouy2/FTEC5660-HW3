@@ -59,6 +59,8 @@ def load_env_file(path: Path = Path(".env")) -> None:
 # gives a PASS or FAIL verdict on these 3 points only, with your own rule for each.
 CHOSEN_POINTS: list[int] = [1, 4, 5]  ### YOUR CODE HERE
 
+from concurrent.futures import ThreadPoolExecutor  # noqa: E402 - kept next to the solution code
+
 
 # ---------------------------------------------------------------------------
 # Solution design
@@ -107,6 +109,14 @@ SELECT (SELECT industry FROM company) AS industry,
 # customer and a competitor always agree, so one good answer is enough and the
 # second role is only tried when the first one cannot comment.
 INTERVIEW_PLAN = {"role": "customer", "fallback_role": "competitor", "topic": "sales_team"}
+
+# Time budget. Each company makes at most three model calls (two interview
+# labels and one summary), all companies run in parallel, so the worst case is
+# about 3 x LLM_TIMEOUT_SECONDS x (LLM_MAX_RETRIES + 1) = 9 minutes, far below
+# the 30-minute limit. A normal run takes about 10 seconds.
+LLM_TIMEOUT_SECONDS = 60
+LLM_MAX_RETRIES = 2
+MAX_WORKERS = 64
 
 # Interview answers in the public data are unambiguous; these are only used if
 # the model call fails, so a company still gets a verdict.
@@ -294,7 +304,15 @@ def build_agent() -> Any:
     ### YOUR CODE HERE
     from langchain_deepseek import ChatDeepSeek
 
-    return ChatDeepSeek(model=MODEL_NAME, temperature=0)
+    # Bound every API call so a slow or hanging API can never push the run past
+    # the 30-minute limit: a call that times out raises, and the keyword rule
+    # (point 4) or the plain evidence text (summary) takes over.
+    return ChatDeepSeek(
+        model=MODEL_NAME,
+        temperature=0,
+        timeout=LLM_TIMEOUT_SECONDS,
+        max_retries=LLM_MAX_RETRIES,
+    )
 
 
 async def analyze_companies(agent: Any, companies: dict[str, list[Any]]) -> dict[str, dict[str, Any]]:
@@ -332,6 +350,12 @@ async def analyze_companies(agent: Any, companies: dict[str, list[Any]]) -> dict
     """
     ### YOUR CODE HERE
     model = agent
+    # One worker thread per company, so all companies really run at the same
+    # time. With the default pool (CPU count + 4) a slow API would make the
+    # companies wait in batches and multiply the worst-case run time.
+    asyncio.get_running_loop().set_default_executor(
+        ThreadPoolExecutor(max_workers=min(MAX_WORKERS, max(1, len(companies))))
+    )
 
     async def guarded(name: str, tools: list[Any]) -> dict[str, Any]:
         try:
